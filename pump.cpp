@@ -12,6 +12,7 @@ Pump::Pump(ProfileManager* pm, Home* h, Log* l)
         connect(home, &Home::insulinLowWarning, this, &Pump::handleLowInsulinWarning);
         connect(home, &Home::occlusionDetected, this, &Pump::occlusionAlert);
         connect(home, &Home::powerShutDown, this, &Pump::emergencyShutdown);
+        connect(home, &Home::batteryLevelChanged, this, &Pump::batteryLevelChanged);
     }
 }
 
@@ -71,9 +72,9 @@ bool Pump::isCharging()
 
 // CGM alert - Related to Requirements 5 and 7
 void Pump::triggerCGMAlert() {
+    std::string errorMsg;  // Create a local error message variable
+    stopInsulinDelivery(errorMsg);
     updateLog("[Alert] CGM Alert triggered!");
-    // Automatically stop insulin delivery when blood glucose is below the threshold
-    stopInsulinDelivery();
 }
 
 // Occlusion alert - Requirement 7
@@ -81,37 +82,105 @@ void Pump::occlusionAlert() {
     if (home) {
         home->checkOcclusion();
     }
-    stopInsulinDelivery();
+    std::string errorMsg;  // Create a local error message variable
+    stopInsulinDelivery(errorMsg);  // pass to the function
     updateLog("[Alert] Occlusion Alert triggered! Insulin delivery stopped.");
 }
 
 // Start insulin delivery - Requirement 5
-void Pump::startInsulinDelivery() {
+bool Pump::startInsulinDelivery(std::string& errorMsg) {
+    InsulinDeliveryState oldState = deliveryState;
+    // Safety check
+    if (!currentProfile) {
+        errorMsg = "No active profile selected.";
+        updateLog("[Error] Cannot start insulin delivery: " + errorMsg);
+        return false;
+    }
+
+    // Check glucose level safety
+    if (currentGlucoseLevel < 70.0f) {  // Assuming 70 mg/dL is the hypoglycemia threshold
+        errorMsg = "Current glucose level is too low.";
+        updateLog("[Alert] Cannot start insulin delivery: " + errorMsg);
+        deliveryState = InsulinDeliveryState::SUSPENDED;
+        logStateChange(oldState, deliveryState);
+        emit deliveryStateChanged(deliveryState);
+        return false;
+    }
+
+    // Start delivery
     insulinDeliveryActive = true;
+    deliveryState = InsulinDeliveryState::ACTIVE;
     updateLog("[Pump] Insulin delivery started.");
+    logStateChange(oldState, deliveryState);
+    emit deliveryStateChanged(deliveryState);
+    return true;
 }
 
 // Stop insulin delivery - Requirement 5
-void Pump::stopInsulinDelivery() {
+bool Pump::stopInsulinDelivery(std::string& errorMsg) {
+    InsulinDeliveryState oldState = deliveryState;
+
+    if (deliveryState == InsulinDeliveryState::INACTIVE) {
+        errorMsg = "Insulin delivery is already inactive.";
+        return true; // Not an error, its already inactive
+    }
+
     insulinDeliveryActive = false;
-    updateLog("[Pump] Insulin delivery stopped.");
+    deliveryState = InsulinDeliveryState::PAUSED;
+    updateLog("[PUMP] Insulin delivery stopped manually.");
+    logStateChange(oldState, deliveryState);
+    emit deliveryStateChanged(deliveryState);
+    return true;
 }
 
 // Resume insulin delivery - Requirement 5
-void Pump::resumeInsulinDelivery() {
+bool Pump::resumeInsulinDelivery(std::string& errorMsg) {
+    InsulinDeliveryState oldState = deliveryState;
+    // Safety check
+    if (!currentProfile) {
+        errorMsg = "No active profile selected.";
+        updateLog("[Error] Cannot resume insulin delivery: " + errorMsg);
+        return false;
+    }
+
+    // Check if the state is paused or suspended
+    if (deliveryState != InsulinDeliveryState::PAUSED && deliveryState != InsulinDeliveryState::SUSPENDED) {
+        errorMsg = "Insulin delivery is not paused or suspended.";
+        updateLog("[Info] " + errorMsg);
+        return false;
+    }
+
+    // If suspended due to low glucose, check if glucose level has recovered
+    if (deliveryState == InsulinDeliveryState::SUSPENDED) {
+        if (currentGlucoseLevel < 80.0f) {  // 80 mg/dL as the safe number
+            errorMsg = "Glucose level still too low.";
+            updateLog("[Alert] Cannot resume insulin delivery: " + errorMsg);
+            return false;
+        }
+    }
+
+    // Resume delivery
     insulinDeliveryActive = true;
-    updateLog("[Pump] Insulin delivery resumed.");
+    deliveryState = InsulinDeliveryState::ACTIVE;
+    updateLog("[PUMP] Insulin delivery resumed.");
+    logStateChange(oldState, deliveryState);
+    emit deliveryStateChanged(deliveryState);
+    return true;
 }
 
 // Deliver bolus insulin - Requirement 4
-void Pump::deliverBolus(float glucoseLevel, float carbIntake) {
+bool Pump::deliverBolus(float glucoseLevel, float carbIntake, std::string& errorMsg) {
     if (!insulinDeliveryActive) {
-        updateLog("[Bolus] Cannot deliver bolus: insulin delivery not active.");
-        return;
+        errorMsg = "Insulin delivery not active.";
+        updateLog("[Bolus] Cannot deliver bolus: " + errorMsg);
+        emit bolusDeliveryFailed(errorMsg);
+        return false;
     }
     if (!currentProfile) {
-        updateLog("[Bolus] Cannot deliver bolus: no active profile selected.");
-        return;
+        errorMsg = "No active profile selected.";
+        updateLog("[Bolus] Cannot deliver bolus: " + errorMsg);
+        emit bolusDeliveryFailed(errorMsg);
+        return false;
     }
 
     // Create a unique ID for this bolus
@@ -126,13 +195,24 @@ void Pump::deliverBolus(float glucoseLevel, float carbIntake) {
     updateLog("[Bolus] Calculated bolus dose: " + std::to_string(calculatedDose) + " units");
 
     updateLog("[Bolus] Bolus delivery confirmed: " + std::to_string(calculatedDose) + " units");
+    emit bolusDeliveryComplete();
+    return true;
 }
 
 // Exteneded bolus - Requirement 4
-void Pump::deliverExtendedBolus(float glucoseLevel, int duration) {
-    if (!insulinDeliveryActive || !currentProfile) {
-        updateLog("[Bolus] Cannot deliver extended bolus: insulin delivery not active or no profile selected.");
-        return;
+bool Pump::deliverExtendedBolus(float glucoseLevel, int duration, std::string& errorMsg) {
+    if (!insulinDeliveryActive) {
+        errorMsg = "Insulin delivery not active.";
+        updateLog("[Bolus] Cannot deliver bolus: " + errorMsg);
+        emit bolusDeliveryFailed(errorMsg);
+        return false;
+    }
+
+    if (!currentProfile) {
+        errorMsg = "No active profile selected.";
+        updateLog("[Bolus] Cannot deliver extended bolus: " + errorMsg);
+        emit bolusDeliveryFailed(errorMsg);
+        return false;
     }
 
     // Create a temporary bolus with the current profile
@@ -149,13 +229,22 @@ void Pump::deliverExtendedBolus(float glucoseLevel, int duration) {
     tempBolus.extendedBolus(hours);
 
     updateLog("[Bolus] Extended bolus started for " + std::to_string(duration) + " minutes");
+    emit bolusDeliveryComplete();
+    return true;
 }
 
 // Quick bolus - Requirement 4
-void Pump::deliverQuickBolus(float glucoseLevel, int duration) {
-    if (!insulinDeliveryActive || !currentProfile) {
-        updateLog("[Bolus] Cannot deliver quick bolus: insulin delivery not active or no profile selected.");
-        return;
+bool Pump::deliverQuickBolus(float glucoseLevel, int duration, std::string& errorMsg) {
+    if (!insulinDeliveryActive) {
+        errorMsg = "Insulin delivery not active.";
+        updateLog("[Bolus] Cannot deliver quick bolus: " + errorMsg);
+        return false;
+    }
+
+    if (!currentProfile) {
+        errorMsg = "No active profile selected.";
+        updateLog("[Bolus] Cannot deliver quick bolus: " + errorMsg);
+        return false;
     }
 
     // Create a temporary bolus with the current profile
@@ -168,6 +257,8 @@ void Pump::deliverQuickBolus(float glucoseLevel, int duration) {
     tempBolus.quickBolus();
 
     updateLog("[Bolus] Quick bolus delivered");
+    emit bolusDeliveryComplete();
+    return true;
 }
 
 // Pause bolus delivery - Requirement 4
@@ -233,16 +324,25 @@ void Pump::cancelBolus() {
 }*/
 
 // create user profile - Requirement 3
-void Pump::createUserProfile(const std::string& mode, float basalRate, float correctionFactor,
-                         float carbRatio, float targetGlucose, std::string& errMsg) {
+bool Pump::createUserProfile(const std::string& mode, float basalRate, float correctionFactor,
+                             float carbRatio, float targetGlucose, std::string& errorMsg) {
     if (profileManager) {
-        profileManager->createProfile(mode, basalRate, correctionFactor, carbRatio, targetGlucose,errMsg);
-        updateLog("[Profile] Created new profile: " + mode);
+        bool success = profileManager->createProfile(mode, basalRate, correctionFactor, carbRatio,
+                                                     targetGlucose, errorMsg);
+        if (success) {
+            updateLog("[Profile] Created new profile: " + mode);
+            return true;
+        } else {
+            updateLog("[Profile] Failed to create profile: " + errorMsg);
+            return false;
+        }
     }
+    errorMsg = "Profile manager is not initialized";
+    return false;
 }
 
 // switch user profile - Requirement 3
-void Pump::switchProfile(const std::string& mode) {
+bool Pump::switchProfile(const std::string& mode, std::string& errorMsg) {
     if (profileManager) {
         Profile* selectedProfile = profileManager->readProfile(mode);
         if (selectedProfile) {
@@ -251,10 +351,15 @@ void Pump::switchProfile(const std::string& mode) {
                 home->selectProfile(selectedProfile);
             }
             updateLog("[Profile] Switched to profile: " + mode);
+            return true;
         } else {
-            updateLog("[Profile] Failed to switch to profile: " + mode);
+            errorMsg = "Failed to find profile: " + mode;
+            updateLog("[Profile] Failed to switch to profile: " + errorMsg);
+            return false;
         }
     }
+    errorMsg = "Profile manager is not initialized";
+    return false;
 }
 
 // Battery alert
@@ -277,22 +382,76 @@ void Pump::handleLowInsulinWarning(int remaining)
 void Pump::emergencyShutdown()
 {
     updateLog("[System] Emergency shutdown initiated due to critical battery level");
-    stopInsulinDelivery();
+    std::string errorMsg;  // Create a local error message variable
+    stopInsulinDelivery(errorMsg);  // pass to the function
     if (bolus && !bolus->isCanceled()) {
         cancelBolus();
     }
     powerOff();;
 }
 
-void Pump::adjustGlucoseLevel(){
-    if(currentProfile->getTargetGlucoseLevels() > home->getGlucoseLevel()){
-        home->setGlucoseLevel(home->getGlucoseLevel() + 0.1);
-    }
-    else if(currentProfile->getTargetGlucoseLevels() < home->getGlucoseLevel()){
-        home->setGlucoseLevel(home->getGlucoseLevel() - 0.1);
+void Pump::checkGlucoseSafety() {
+    if (deliveryState == InsulinDeliveryState::ACTIVE && currentGlucoseLevel < 70.0f) {
+        InsulinDeliveryState oldState = deliveryState;
+
+        // Automatically suspend delivery
+        insulinDeliveryActive = false;
+        deliveryState = InsulinDeliveryState::SUSPENDED;
+        updateLog("[Alert] Insulin delivery automatically suspended due to low glucose level.");
+        logStateChange(oldState, deliveryState);
+
+        emit deliveryStateChanged(deliveryState);
+
+        // Trigger CGM alert
+        triggerCGMAlert();
     }
 }
 
+// Log state changes
+void Pump::logStateChange(InsulinDeliveryState oldState, InsulinDeliveryState newState) {
+    if (oldState == newState) {
+        return;
+    }
+
+    std::string oldStateStr, newStateStr;
+
+    // Convert enum to string
+    switch (oldState) {
+    case InsulinDeliveryState::INACTIVE: oldStateStr = "INACTIVE"; break;
+    case InsulinDeliveryState::ACTIVE: oldStateStr = "ACTIVE"; break;
+    case InsulinDeliveryState::PAUSED: oldStateStr = "PAUSED"; break;
+    case InsulinDeliveryState::SUSPENDED: oldStateStr = "SUSPENDED"; break;
+    }
+
+    switch (newState) {
+    case InsulinDeliveryState::INACTIVE: newStateStr = "INACTIVE"; break;
+    case InsulinDeliveryState::ACTIVE: newStateStr = "ACTIVE"; break;
+    case InsulinDeliveryState::PAUSED: newStateStr = "PAUSED"; break;
+    case InsulinDeliveryState::SUSPENDED: newStateStr = "SUSPENDED"; break;
+    }
+
+    updateLog("[STATE] Insulin delivery state changed: " + oldStateStr + " -> " + newStateStr);
+}
+
+// Set the current glucose level
+void Pump::setCurrentGlucoseLevel(float level) {
+    float oldLevel = currentGlucoseLevel;
+    currentGlucoseLevel = level;
+
+    updateLog("[CGM] Glucose level updated: " + std::to_string(level) + " mg/dL");
+
+    // If glucose level changes significantly, check safety
+    if (std::abs(oldLevel - level) > 15.0f) {
+        checkGlucoseSafety();
+    }
+}
+
+// Get insulin delivery state
+InsulinDeliveryState Pump::getDeliveryState() const {
+    return deliveryState;
+}
+
+// Get the current glucose level
 float Pump::getCurrentGlucoseLevel() const {
     return currentGlucoseLevel;
 }
