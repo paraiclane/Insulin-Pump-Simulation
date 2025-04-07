@@ -3,14 +3,17 @@
 
 #include <QWidget>
 #include <QPushButton>
-#include <QtCharts/QChartView>
+#include <QProgressBar>
+#include <QtCharts>
 #include <QtCharts/QScatterSeries>
-#include "QErrorMessage.h"
+#include "qerrormessage.h"
+#include "qpersonalprofiles.h"
+
 
 class QHomeWindow : public QWidget {
     Q_OBJECT
 public:
-    explicit QHomeWindow(QWidget *parent = nullptr);
+    explicit QHomeWindow(Pump* pump, QWidget *parent = nullptr);
 
 signals:
     void navBolusRequested();
@@ -19,16 +22,34 @@ signals:
 private slots:
     void navBolus();
     void navOptions();
-    void updateGraph();
+    void updateSim();
+    void showOcclusionAlert();
+    void showCGMAlert();
+    void startDelivery();
+    void pauseDelivery();
+    void resumeDelivery();
+    void stopDelivery();
+    void updateBatteryDisplay();
+    void handleBatteryLevelChanged(float level);
+    void updateInsulinDisplay();
+    void handleInsulinLevelChanged(int remaining);
 
 private:
     QPushButton *bolusButton;
     QPushButton *optionsButton;
-    QtCharts::QScatterSeries *series
-    QTextEdit *time;
-    QTimer *timer; 
-    QErrorMessage *errorMessage;
-    int timeStep;
+    QScatterSeries *series;
+    QPushButton *occlusionAlertButton;
+    QPushButton  *CGMAlertButton;
+    QTimer *timer;
+    int timeStep = 0;
+    QPushButton *startDeliveryButton;
+    QPushButton *pauseDeliveryButton;
+    QPushButton *resumeDeliveryButton;
+    QPushButton *stopDeliveryButton;
+    QProgressBar *batteryProgressBar;
+    QProgressBar *insulinProgressBar;
+
+    Pump* pump;
 };
 
 #endif // QHOMEWINDOW_H
